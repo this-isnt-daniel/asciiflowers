@@ -29,3 +29,13 @@ After that it keeps swaying gently.
 ## How it works
 
 Each frame draws the lilies with ordinary canvas shapes onto a tiny offscreen canvas, one pixel per character cell. Each pixel is then redrawn as a glyph from ` .:-=+*cxoaX#%&@`, picked by brightness and coloured with the pixel's colour. A faint blurred copy underneath gives the glow.
+
+## Orchids
+
+Open orchids.html for the standalone ASCII orchid animation. Click or press Space to replay; press P to cycle palettes.
+
+
+## Deploy to Vercel
+
+Run npm.cmd run build to prepare dist/. The deployed homepage is orchids; lilies are at /lilies.html. Import the GitHub repository into Vercel using framework Other, build command npm run build, and output directory dist (configured in vercel.json). No environment variables are required.
+

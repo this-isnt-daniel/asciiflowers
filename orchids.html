@@ -1,0 +1,672 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>ASCII Orchids</title>
+<style>
+  :root { background: #000; margin: 0; padding: 0; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #000; overflow: hidden; height: 100dvh; }
+  canvas { display: block; width: 100%; height: 100%; touch-action: manipulation; }
+  #hint {
+    position: fixed; bottom: calc(18px + env(safe-area-inset-bottom, 0px)); left: 50%; transform: translateX(-50%);
+    color: rgba(200,170,220,0.45); font: 11px/1 Menlo, monospace;
+    letter-spacing: 0.08em; pointer-events: none; width: calc(100% - 32px);
+    text-align: center; line-height: 1.6; text-wrap: balance;
+  }
+</style>
+</head>
+<body>
+<canvas id="screen"></canvas>
+<div id="hint">click or [space] to replay &nbsp;·&nbsp; [p] to cycle palette</div>
+<script>
+(() => {
+  'use strict';
+
+  const RAMP = ' .:-=+*cxoaX#%&@';
+  const WORLD_W = 1000;
+  const WORLD_H = 1100;
+  const FPS = 30;
+
+  // Orchid palettes
+  const PALETTES = [
+    { // Phalaenopsis — white/purple
+      petal: '#f4eef9', edge: '#ffffff', blush: '#d8bce8', throat: '#ffc94d',
+      lip: '#c050c8', lipEdge: '#8820aa', vein: 'rgba(130,45,165,0.65)',
+      anther: '#f0ead0', spots: true,
+    },
+    { // Cattleya — magenta
+      petal: '#e060b8', edge: '#f8a0d8', blush: '#d040a0', throat: '#ffc247',
+      lip: '#a01888', lipEdge: '#6a0066', vein: 'rgba(100,15,135,0.72)',
+      anther: '#f5e8b0', spots: false,
+    },
+    { // Cymbidium — green/cream
+      petal: '#d8e8c0', edge: '#f0f4e4', blush: '#b8d090', throat: '#ffd15a',
+      lip: '#d84040', lipEdge: '#a01818', vein: 'rgba(115,50,140,0.55)',
+      anther: '#f0e8b0', spots: true,
+    },
+  ];
+
+  // ---- helpers (unchanged from original) ----
+  function rng(seed) {
+    return () => {
+      seed |= 0; seed = (seed + 0x6D2B79F5) | 0;
+      let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const prog = (T, start, dur) => clamp((T - start) / dur, 0, 1);
+  const easeOut = t => 1 - Math.pow(1 - t, 3);
+  const easeInOut = t => t < 0.5 ? 4*t*t*t : 1 - Math.pow(-2*t+2,3)/2;
+  const smooth = (a, b, t) => { const x = clamp((t-a)/(b-a),0,1); return x*x*(3-2*x); };
+  const rad = d => (d * Math.PI) / 180;
+
+  function rgbOf(c) {
+    if (c[0]==='#') { const n=parseInt(c.slice(1),16); return [(n>>16)&255,(n>>8)&255,n&255]; }
+    return c.match(/\d+/g).slice(0,3).map(Number);
+  }
+  function mix(a, b, t) {
+    const A=rgbOf(a), B=rgbOf(b);
+    return `rgb(${Math.round(lerp(A[0],B[0],t))},${Math.round(lerp(A[1],B[1],t))},${Math.round(lerp(A[2],B[2],t))})`;
+  }
+  function bez(p, t) {
+    const u=1-t;
+    return [
+      u*u*u*p[0][0]+3*u*u*t*p[1][0]+3*u*t*t*p[2][0]+t*t*t*p[3][0],
+      u*u*u*p[0][1]+3*u*u*t*p[1][1]+3*u*t*t*p[2][1]+t*t*t*p[3][1],
+    ];
+  }
+  function bezAngle(p, t) {
+    const a=bez(p,Math.max(0,t-0.01)), b=bez(p,Math.min(1,t+0.01));
+    return Math.atan2(b[1]-a[1], b[0]-a[0]);
+  }
+
+  let T = 0;
+  function sway(x, y) {
+    const lift = clamp((1090-y)/800,0,1);
+    return [x + Math.sin(T*0.9+y*0.006)*7*lift + Math.sin(T*0.43+x*0.004)*3*lift, y];
+  }
+
+  // ---- timeline ----
+  const STEM_START=0, STEM_DUR=2.8;
+  const LEAF_START=1.0;
+  const BUD_START=2.4;
+  const BLUSH_START=3.8;
+  const OPEN_START=5.2, OPEN_GAP=0.9, OPEN_DUR=3.4;
+
+  // ---- scene ----
+  function buildScene() {
+    const r = rng(42);
+    const S = { stems: [], leaves: [], buds: [] };
+
+    // Orchid stems arch more gently, spikes spread outward from a low base
+    const tops = [
+      [235, 460, 3], [340, 300, 3], [490, 220, 4], [645, 295, 3],
+      [765, 410, 3], [800, 565, 2], [300, 620, 2], [680, 635, 2],
+    ];
+
+    for (const [tx, ty, nbuds] of tops) {
+      const bx = 490 + r()*20;
+      // Orchid spikes arch more — stronger lateral control points
+      const stem = [
+        [bx, 1090],
+        [bx + (tx-bx)*0.08, 870],
+        [lerp(bx,tx,0.65), ty+200],
+        [tx, ty],
+      ];
+      const lean = (tx-500)*0.08;
+      const stemRef = { pts: stem, start: STEM_START + r()*0.5 };
+      S.stems.push(stemRef);
+
+      // Orchid leaves: longer, strap-like, fewer per stem, low on the stem
+      const nLeaves = 2 + Math.floor(r()*2);
+      for (let i = 0; i < nLeaves; i++) {
+        const t = 0.08 + (i/nLeaves)*0.28 + r()*0.04;
+        const side = i%2 ? 1 : -1;
+        S.leaves.push({
+          stem, t, side,
+          len: 130 + r()*80,  // longer strap leaves
+          w: 16 + r()*7,
+          spread: rad(18 + r()*18),  // less spread than lily
+          start: LEAF_START + t*1.2 + r()*0.3,
+          tint: r(),
+        });
+      }
+
+      // Buds along the spike: rachis-style arrangement up the top portion
+      // Terminal bud at top + multiple alternate buds down the spike
+      for (let k = 0; k < nbuds; k++) {
+        const at = 1 - k*(0.12 + r()*0.04);
+        const side = k%2 ? 1 : -1;
+        const base = bez(stem, at);
+        const ang = rad(-90 + lean*0.5 + side*(k===0?0:20+r()*15));
+        const pedLen = k===0 ? 0 : 45 + r()*35;
+        let ped = null;
+        if (k > 0) {
+          const end = [base[0]+Math.cos(ang)*pedLen, base[1]+Math.sin(ang)*pedLen];
+          ped = [base,
+            [lerp(base[0],end[0],0.3), base[1]-pedLen*0.25],
+            [lerp(base[0],end[0],0.8), lerp(base[1],end[1],0.65)],
+            end];
+        }
+        S.buds.push({ stem, stemRef, at, ped, dir: ang });
+      }
+    }
+
+    // Assign bloom order and fate
+    const order = S.buds.map((_,i)=>i).sort(()=>r()-0.5);
+    order.forEach((idx, rank) => {
+      const b = S.buds[idx];
+      b.len = 72 + r()*24;      // shorter — rounder flowers don't need long tepals
+      b.width = 32 + r()*10;   // wider relative to length
+      b.squash = 0.7 + r()*0.2;
+      b.twist = (r()-0.5)*0.5;
+      b.droop = rad((b.dir > rad(-90)?1:-1)*(10 + r()*18));
+      b.colorIdx = rank;
+      b.rnd = Array.from({length:16}, r);
+      b.grow = BUD_START + r()*1.4;
+      b.openDuration = OPEN_DUR * (0.8 + b.rnd[15] * 0.5);
+      if (rank < 7) {
+        b.maxOpen=1; b.blush=1; b.openAt=OPEN_START+rank*OPEN_GAP+r()*0.4;
+      } else if (rank < 12) {
+        b.maxOpen=0.06; b.blush=0.75; b.openAt=OPEN_START+2+r()*5;
+      } else {
+        b.maxOpen=0; b.blush=0.1+r()*0.2; b.openAt=Infinity; b.len*=0.7;
+      }
+    });
+
+    addFillers(S);
+    return S;
+  }
+
+  // Orchid companions: ferns + gypsophila
+  const FERN_START = 0.5;
+  const GYP_START = 2.2;
+
+  function addFillers(S) {
+    const r = rng(37);
+    S.ferns = [];
+    S.gyp = [];
+
+    // Maidenhair fern fronds: main rachis, alternate pinnae
+    const frond = (base, ang, len, start) => {
+      const end = [base[0]+Math.cos(ang)*len, base[1]+Math.sin(ang)*len];
+      const bend = (r()-0.5)*len*0.25;
+      const pts = [base,
+        [lerp(base[0],end[0],0.3)+bend, lerp(base[1],end[1],0.3)],
+        [lerp(base[0],end[0],0.72)+bend*0.4, lerp(base[1],end[1],0.72)],
+        end];
+      const pinnae = [];
+      for (let t=0.1+r()*0.06, i=0; t<=1; t+=0.065+r()*0.03, i++) {
+        pinnae.push({ t, side: i%2?1:-1, len: 28+r()*18, w: 9+r()*4, tint: r() });
+      }
+      S.ferns.push({ pts, pinnae, start });
+    };
+    for (const end of [[190,520],[250,310],[430,200],[580,195],[760,300],[820,530]]) {
+      const base = [492+r()*16, 830-r()*50];
+      const ang = Math.atan2(end[1]-base[1], end[0]-base[0]);
+      frond(base, ang, Math.hypot(end[0]-base[0],end[1]-base[1]), FERN_START+r()*0.9);
+    }
+
+    // Gypsophila (same as original but lighter density)
+    const clouds = [
+      [330,450],[670,420],[500,320],[270,600],[750,600],
+      [460,600],[600,635],[390,335],[630,335],[510,510],
+    ];
+    clouds.forEach(([cx,cy],ci) => {
+      const base=[488+r()*24, 1005+r()*55];
+      const start=GYP_START+ci*0.1+r()*0.35;
+      const outward=Math.atan2(cy-620, cx-500);
+      const segs=[], flowers=[];
+      const branch=(x,y,ang,len,depth,t)=>{
+        const x2=x+Math.cos(ang)*len, y2=y+Math.sin(ang)*len;
+        segs.push({x,y,x2,y2,t,w:1.5+depth*0.8});
+        const t2=t+0.18;
+        if(depth===0){ flowers.push({x:x2,y:y2,s:4+r()*3,t:t2+r()*0.3,puffs:2+Math.floor(r()*2)}); return; }
+        if(depth<3&&r()<0.7) flowers.push({x:x2,y:y2,s:3+r()*2.5,t:t2+r()*0.3,puffs:1});
+        const kids=2+(r()<0.4?1:0);
+        for(let k=0;k<kids;k++){
+          const spread=rad(lerp(-65,65,kids===1?0.5:k/(kids-1))+(r()-0.5)*28);
+          const target=lerp(ang+spread, outward, 0.22);
+          branch(x2,y2,target,len*(0.42+r()*0.42),depth-1,t2);
+        }
+      };
+      branch(cx,cy+40,outward*0.5-Math.PI/4,38+r()*12,4,0.6);
+      S.gyp.push({segs,flowers,start,front:ci%2===1});
+    });
+  }
+
+  // ---- drawing ----
+  function strokeCurve(g, pts, from, upto, width, color) {
+    if(upto<=from) return;
+    const N=36;
+    g.beginPath();
+    for(let i=0;i<=N;i++){
+      const p=bez(pts,lerp(from,upto,i/N));
+      const q=sway(p[0],p[1]);
+      i ? g.lineTo(q[0],q[1]) : g.moveTo(q[0],q[1]);
+    }
+    g.lineWidth=width; g.strokeStyle=color; g.lineCap='round'; g.stroke();
+  }
+
+  function stemProgress(st) { return easeInOut(prog(T, st.start, STEM_DUR)); }
+
+  // Orchid strap leaf — longer, flatter, with parallel venation
+  function drawLeaf(g, lf) {
+    const p = easeOut(prog(T, lf.start, 1.6));
+    if(!p) return;
+    const a = bez(lf.stem, lf.t);
+    const [x,y] = sway(a[0],a[1]);
+    const ang = bezAngle(lf.stem, lf.t) + lf.side*lf.spread*(0.3+0.7*p);
+    const L=lf.len*p, W=lf.w*(0.5+0.5*p);
+    g.save();
+    g.translate(x,y);
+    g.rotate(ang);
+    // flatter arc for strap leaf
+    const bend = lf.side*L*0.07;
+    g.beginPath();
+    g.moveTo(0,0);
+    g.bezierCurveTo(L*0.3,-W*0.75, L*0.72,-W*0.7+bend*0.4, L*0.96, bend);
+    g.bezierCurveTo(L*0.72, W*0.7+bend*0.4, L*0.3, W*0.75, 0, 0);
+    const grad = g.createLinearGradient(0,0,L,0);
+    grad.addColorStop(0, '#2a6020');
+    grad.addColorStop(0.5, lf.tint>0.5?'#4a9028':'#3c8024');
+    grad.addColorStop(1, '#6ab040');
+    g.fillStyle=grad; g.fill();
+    g.strokeStyle='rgba(0,0,0,0.5)'; g.lineWidth=5; g.stroke();
+    // parallel veins (orchid trait)
+    g.strokeStyle='rgba(20,55,15,0.65)'; g.lineWidth=2;
+    for(let v=-1;v<=1;v++){
+      const off=v*W*0.35;
+      g.beginPath();
+      g.moveTo(L*0.05, off*0.3);
+      g.quadraticCurveTo(L*0.55, off+bend*0.2, L*0.92, off*0.6+bend*0.85);
+      g.stroke();
+    }
+    g.restore();
+  }
+
+  // ---- Orchid flower: 3 sepals + 2 petals + 1 labellum + column ----
+
+  // Broad rounded petal/sepal — egg-shaped, wide belly, blunt rounded tip
+  function sepalPetal(g, L, W, color, edge, throat, vein, open, isSepal, spots, rnd) {
+    // sepals slightly narrower than petals, but both are wide and rounded
+    const wm = isSepal ? 1.0 : 1.3;
+    // tip is rounded, barely any curl
+    const tipX = L * 0.82;
+    const tipY = 0;
+    g.beginPath();
+    g.moveTo(0, 0);
+    // push control points wide and early so the belly is fat, not pointy
+    g.bezierCurveTo(L*0.18, -W*wm*1.3, L*0.55, -W*wm*1.35, tipX, tipY);
+    g.bezierCurveTo(L*0.55,  W*wm*1.35, L*0.18,  W*wm*1.3,  0, 0);
+    const grad = g.createLinearGradient(0, 0, L, 0);
+    grad.addColorStop(0, throat);
+    grad.addColorStop(lerp(0.45, 0.2, open), color);
+    grad.addColorStop(1, edge);
+    g.fillStyle = grad; g.fill();
+    g.strokeStyle = 'rgba(0,0,0,0.55)'; g.lineWidth = 4; g.stroke();
+    // central vein
+    g.strokeStyle = open > 0.15 ? vein : 'rgba(30,60,20,0.5)';
+    g.lineWidth = 4.5;
+    g.beginPath(); g.moveTo(L*0.04, 0);
+    g.quadraticCurveTo(L*0.5, 0, tipX*0.9, 0); g.stroke();
+    if (open > 0.35) {
+      g.lineWidth = 2.5;
+      for (const side of [-1, 1]) {
+        g.beginPath();
+        g.moveTo(L*0.12, 0);
+        g.quadraticCurveTo(L*0.35, side*W*wm*0.65, tipX*0.76, side*W*wm*0.23);
+        g.stroke();
+      }
+    }
+    if (spots && open > 0.5) {
+      g.fillStyle = `rgba(90,0,120,${(open-0.5)*1.6})`;
+      for (let i = 0; i < 6; i++) {
+        g.beginPath();
+        g.arc(L*(0.12+rnd[i]*0.32), (rnd[i+5]-0.5)*W*wm*1.1, 2.5+rnd[i+8]*2, 0, Math.PI*2);
+        g.fill();
+      }
+    }
+  }
+
+  // Labellum — the orchid's distinctive lip: wider, lobed, ruffled edges
+  function labellum(g, L, W, lip, lipEdge, throat, open, rnd) {
+    const rc = smooth(0.3, 1, open);
+    const spread = W * 1.9 * rc;
+    // three-lobed shape: two lateral lobes + central lobe projecting forward
+    g.beginPath();
+    g.moveTo(0, 0);
+    // left lobe
+    g.bezierCurveTo(L*0.1, -spread*0.5, L*0.35, -spread*0.9, L*0.5, -spread*0.6);
+    // central lobe tip
+    g.bezierCurveTo(L*0.65, -spread*0.3, L*0.9, -spread*0.1, L*1.0, 0);
+    // right half mirror
+    g.bezierCurveTo(L*0.9, spread*0.1, L*0.65, spread*0.3, L*0.5, spread*0.6);
+    g.bezierCurveTo(L*0.35, spread*0.9, L*0.1, spread*0.5, 0, 0);
+    const grad=g.createLinearGradient(0,-spread,L,spread);
+    grad.addColorStop(0, throat);
+    grad.addColorStop(0.3, mix(lip, throat, 0.4));
+    grad.addColorStop(1, lip);
+    g.fillStyle=grad; g.fill();
+    g.strokeStyle='rgba(0,0,0,0.65)'; g.lineWidth=5; g.stroke();
+    // ruffled edge — a secondary frilled outline
+    if(rc>0.3){
+      g.strokeStyle=lipEdge; g.lineWidth=3;
+      const ruffle=5*rc;
+      g.beginPath();
+      for(let s=-1;s<=1;s+=2){
+        g.moveTo(0,0);
+        for(let i=1;i<=12;i++){
+          const ft=i/12;
+          // sample along the outer arc, add sinusoidal ruffle
+          const bx=lerp(0,L,ft);
+          const by=s*lerp(0,spread*0.9,Math.sin(ft*Math.PI))+(Math.sin(ft*Math.PI*4+rnd[0]*6)*ruffle);
+          g.lineTo(bx,by);
+        }
+      }
+      g.stroke();
+    }
+    // callus — the raised ridges down the centre of the lip
+    if(open>0.4){
+      g.strokeStyle=`rgba(255,220,20,${(open-0.4)*1.4})`;
+      g.lineWidth=5;
+      for(let r2=-1;r2<=1;r2++){
+        g.beginPath();
+        g.moveTo(L*0.1, r2*spread*0.12);
+        g.quadraticCurveTo(L*0.4, r2*spread*0.08, L*0.7, r2*spread*0.04);
+        g.stroke();
+      }
+    }
+  }
+
+  // Column — the fused stamen/pistil structure unique to orchids
+  function drawColumn(g, L, open, pal) {
+    const st = smooth(0.5, 1, open);
+    if(!st) return;
+    const cl = L*0.28*st;
+    // column body
+    g.fillStyle=mix('#e0d8b0','#f8f0c8',0.5);
+    g.beginPath();
+    g.ellipse(cl*0.6, 0, cl*0.6, cl*0.22, 0, 0, Math.PI*2);
+    g.fill();
+    g.strokeStyle='rgba(0,0,0,0.4)'; g.lineWidth=3; g.stroke();
+    // pollinia cap at the tip (two waxy yellow blobs)
+    g.fillStyle=pal.anther;
+    for(const s of [-1,1]){
+      g.beginPath();
+      g.ellipse(cl*1.1, s*cl*0.12, cl*0.18, cl*0.12, rad(20)*s, 0, Math.PI*2);
+      g.fill();
+    }
+  }
+
+  function budState(b) {
+    const grow = easeOut(prog(T, b.grow, 2.4));
+    const blush = smooth(0,1,prog(T, BLUSH_START+(b.grow-BUD_START),2.5))*b.blush;
+    const open = easeInOut(prog(T, b.openAt, b.openDuration))*b.maxOpen;
+    return { grow, blush, open };
+  }
+
+  function drawBud(g, b, pal) {
+    const sp = stemProgress(b.stemRef);
+    if(b.ped){
+      if(sp < b.at) return;
+      const pp = easeOut(prog(T, b.stemRef.start+STEM_DUR*b.at, 0.9));
+      strokeCurve(g, b.ped, 0, pp, 5, '#5a9030');
+      if(pp < 0.55) return;
+    } else if(sp < 0.98){ return; }
+
+    const { grow, blush, open } = budState(b);
+    if(!grow) return;
+
+    const base = b.ped ? b.ped[3] : bez(b.stem, 1);
+    const [x,y] = sway(base[0],base[1]);
+    const multi = Array.isArray(pal.petal);
+    const petal = multi ? pal.petal[b.colorIdx % pal.petal.length] : pal.petal;
+    const edge = pal.edge || mix(petal,'#ffffff',0.2);
+
+    // Colour transition: green bud → blush → petal
+    const budCol = mix('#90c038', pal.blush, blush);
+    const color = mix(budCol, petal, smooth(0.05,0.5,open));
+    const edgeCol = mix(mix('#a8d050',pal.blush,blush), edge, smooth(0.05,0.5,open));
+    const throat = mix('#80b030', pal.throat, open);
+
+    const L = b.len*(0.3+0.7*grow)*(1+0.25*open);
+    const W = b.width*(0.6+0.4*grow)*(1+1.2*open);
+
+    g.save();
+    g.translate(x,y);
+    g.rotate(b.dir + b.droop*open);
+    g.scale(1, lerp(1, b.squash, open));
+
+    // ovary / receptacle (bump behind the flower)
+    g.fillStyle='#5a9030';
+    g.beginPath(); g.ellipse(-L*0.08, 0, L*0.1, W*0.18, 0, 0, Math.PI*2); g.fill();
+
+    g.rotate(b.twist*open);
+
+    // Orchid arrangement: dorsal sepal (top), 2 lateral sepals, 2 petals, labellum
+    // Closed bud: all overlap into teardrop. Open: spread into the classic orchid silhouette.
+
+    // Open Phalaenopsis silhouette: 5 parts spread ~72° apart like a star,
+    // plus a small labellum in the centre pointing straight forward.
+    // Closed: all stacked along forward axis. Open: fan out evenly.
+
+    // dorsal sepal — sweeps straight up (270°)
+    g.save();
+    g.rotate(rad(lerp(0, -90, open)));
+    sepalPetal(g, L, W, color, edgeCol, throat, pal.vein, open, true, pal.spots, b.rnd);
+    g.restore();
+
+    // 2 lateral sepals — spread to lower-left and lower-right (~144° and ~216°)
+    for (const side of [-1, 1]) {
+      g.save();
+      g.rotate(rad(lerp(5, 144, open) * side));
+      sepalPetal(g, L*0.95, W, color, edgeCol, throat, pal.vein, open, true, pal.spots, b.rnd);
+      g.restore();
+    }
+
+    // 2 broad petals — upper-left and upper-right (~36° and ~324°, i.e. ±36°)
+    for (const side of [-1, 1]) {
+      g.save();
+      g.rotate(rad(lerp(3, 36, open) * side));
+      sepalPetal(g, L*0.9, W*1.15, color, edgeCol, throat, pal.vein, open, false, pal.spots, b.rnd);
+      g.restore();
+    }
+
+    // labellum — compact, sits in the centre, points straight forward
+    g.save();
+    labellum(g, L*0.55, W*0.55, mix(budCol, pal.lip, smooth(0, 0.55, open)), pal.lipEdge, throat, open, b.rnd);
+    g.restore();
+
+    // column in the throat
+    drawColumn(g, L, open, pal);
+
+    g.restore();
+  }
+
+  function drawFerns(g, S) {
+    for(const sp of S.ferns){
+      const p = easeOut(prog(T, sp.start, 2.4));
+      if(!p) continue;
+      strokeCurve(g, sp.pts, 0, p, 3.5, '#3c6428');
+      for(const pinna of sp.pinnae){
+        const lp = easeOut(prog(p, pinna.t-0.05, 0.2));
+        if(!lp) continue;
+        const a = bez(sp.pts, pinna.t);
+        const [x,y] = sway(a[0],a[1]);
+        g.save();
+        g.translate(x,y);
+        g.rotate(bezAngle(sp.pts,pinna.t) + pinna.side*rad(42));
+        const L=pinna.len*lp, W=pinna.w*lp;
+        // fern pinnae: fan-shaped with serrated outline
+        g.beginPath();
+        g.moveTo(0,0);
+        g.bezierCurveTo(L*0.28,-W*0.9, L*0.7,-W*0.85+pinna.side*L*0.06, L, pinna.side*L*0.06);
+        g.bezierCurveTo(L*0.7, W*0.85+pinna.side*L*0.06, L*0.28, W*0.9, 0, 0);
+        const grad=g.createLinearGradient(0,0,L,0);
+        grad.addColorStop(0, pinna.tint>0.5?'#2e5820':'#285422');
+        grad.addColorStop(0.6, pinna.tint>0.5?'#4e9038':'#469034');
+        grad.addColorStop(1, '#38783a');
+        g.fillStyle=grad; g.fill();
+        g.strokeStyle='rgba(0,0,0,0.55)'; g.lineWidth=3.5; g.stroke();
+        g.strokeStyle='rgba(140,185,100,0.5)'; g.lineWidth=1.5;
+        g.beginPath(); g.moveTo(0,0); g.lineTo(L*0.88, pinna.side*L*0.055); g.stroke();
+        g.restore();
+      }
+    }
+  }
+
+  function drawGyp(g, S, front) {
+    for(const c of S.gyp){
+      if(c.front!==front) continue;
+      const p = prog(T, c.start, 3.0);
+      if(!p) continue;
+      const local = p*3.0 - 0.5;
+      g.strokeStyle='#6a8848';
+      for(const sg of c.segs){
+        const k=clamp((local-sg.t)/0.25,0,1);
+        if(!k) continue;
+        const [x,y]=sway(sg.x,sg.y), [x2,y2]=sway(sg.x2,sg.y2);
+        g.lineWidth=sg.w;
+        g.beginPath(); g.moveTo(x,y); g.lineTo(lerp(x,x2,k),lerp(y,y2,k)); g.stroke();
+      }
+      for(const f of c.flowers){
+        const k=easeOut(clamp((local-f.t)/0.5,0,1));
+        if(!k) continue;
+        const [x,y]=sway(f.x,f.y);
+        const tw=0.9+0.1*Math.sin(T*2.3+f.x*0.3);
+        g.fillStyle=`rgba(252,250,245,${tw})`;
+        for(let i=0;i<f.puffs;i++){
+          g.beginPath();
+          g.arc(x+(i-(f.puffs-1)/2)*f.s*0.9, y-(i%2)*f.s*0.6, f.s*k, 0, Math.PI*2);
+          g.fill();
+        }
+      }
+    }
+  }
+
+  function drawScene(g, S, pal) {
+    drawFerns(g, S);
+    drawGyp(g, S, false);
+    for(const st of S.stems) strokeCurve(g, st.pts, 0, stemProgress(st), 8, '#5a9828');
+    for(const lf of S.leaves) drawLeaf(g, lf);
+    const sorted = S.buds.slice().sort((a,b)=>budState(a).open-budState(b).open||(a.openAt-b.openAt||0));
+    for(const b of sorted) drawBud(g, b, pal);
+    drawGyp(g, S, true);
+  }
+
+  // ---- ascii renderer (unchanged) ----
+  const screen = document.getElementById('screen');
+  const sctx = screen.getContext('2d');
+  const off = document.createElement('canvas');
+  const octx = off.getContext('2d', {willReadFrequently:true});
+
+  let cols=0, rows=0, cellW=0, cellH=0, fontSize=0, dpr=1;
+  const styleCache = new Map();
+  function style(r, g, b) {
+    const key=(r<<16)|(g<<8)|b;
+    let s=styleCache.get(key);
+    if(!s){ s=`rgb(${r},${g},${b})`; styleCache.set(key,s); }
+    return s;
+  }
+
+  function resize() {
+    dpr=Math.min(window.devicePixelRatio||1,2);
+    const {width:w, height:h}=screen.getBoundingClientRect();
+    fontSize=Math.max(4,Math.min(11,Math.floor(Math.min(w/100,h/85))));
+    sctx.font=`bold ${fontSize}px Menlo, Consolas, "DejaVu Sans Mono", monospace`;
+    cellW=sctx.measureText('M').width||fontSize*0.6;
+    cellH=fontSize;
+    screen.width=Math.floor(w*dpr);
+    screen.height=Math.floor(h*dpr);
+    cols=Math.ceil(w/cellW);
+    rows=Math.ceil(h/cellH);
+    off.width=cols; off.height=rows;
+  }
+
+  function render(S, pal) {
+    const aspect=cellH/cellW;
+    // Fit the full scene, including petals and sway, above the control hint.
+    const hint=document.getElementById('hint');
+    const reserved=screen.getBoundingClientRect().bottom-hint.getBoundingClientRect().top+16;
+    const padding=16;
+    const availableW=cols-2*padding/cellW;
+    const availableH=rows-(reserved+padding)/cellH;
+    const margin=70;
+    const sx=Math.max(0.001,Math.min(availableW/(WORLD_W+2*margin),
+      availableH*aspect/(WORLD_H+2*margin)));
+    octx.setTransform(1,0,0,1,0,0);
+    octx.fillStyle='#000';
+    octx.fillRect(0,0,cols,rows);
+    octx.setTransform(sx,0,0,sx/aspect,(cols-WORLD_W*sx)/2,
+      padding/cellH+(availableH-WORLD_H*sx/aspect)/2);
+    drawScene(octx,S,pal);
+
+    const data=octx.getImageData(0,0,cols,rows).data;
+    sctx.setTransform(dpr,0,0,dpr,0,0);
+    sctx.fillStyle='#000'; sctx.fillRect(0,0,screen.width,screen.height);
+    sctx.save();
+    sctx.globalAlpha=0.4;
+    sctx.filter=`blur(${Math.round(cellH*0.4)}px)`;
+    sctx.imageSmoothingEnabled=true;
+    sctx.drawImage(off,0,0,cols*cellW,rows*cellH);
+    sctx.restore();
+    sctx.font=`bold ${fontSize}px Menlo, Consolas, "DejaVu Sans Mono", monospace`;
+    sctx.textBaseline='top';
+    const n=RAMP.length-1;
+    // Stable character texture keeps the petals soft as they sway.
+    for(let y=0;y<rows;y++){
+      for(let x=0;x<cols;x++){
+        const i=(y*cols+x)*4;
+        const r=data[i], gg=data[i+1], b=data[i+2];
+        const m=Math.max(r,gg,b);
+        if(m<14) continue;
+        const v=m/255;
+        const h=((x*73856093)^(y*19349663))>>>0;
+        const j=h%23===0?(h&8?1:-1):0;
+        const idx=clamp(Math.round(Math.pow(v,0.7)*n)+j,1,n);
+        const k=Math.min(1.25,(40+215*v)/m);
+        sctx.fillStyle=style(Math.min(255,(r*k)|0)&0xf8,Math.min(255,(gg*k)|0)&0xf8,Math.min(255,(b*k)|0)&0xf8);
+        sctx.fillText(RAMP[idx],x*cellW,y*cellH);
+      }
+    }
+  }
+
+  // ---- loop ----
+  const S = buildScene();
+  let palette=1;
+  let t0=performance.now();
+  let last=0;
+
+  function frame(now) {
+    requestAnimationFrame(frame);
+    if(now-last<1000/FPS) return;
+    last=now;
+    T=(now-t0)/1000;
+    render(S,PALETTES[palette]);
+  }
+
+  const replay=()=>{ t0=performance.now(); };
+  window.addEventListener('resize', resize);
+  window.visualViewport?.addEventListener('resize', resize);
+  screen.addEventListener('click', replay);
+  window.addEventListener('keydown', e=>{
+    if(e.key===' '||e.key==='r') replay();
+    if(e.key==='p'||e.key==='c'){ palette=(palette+1)%PALETTES.length; replay(); }
+  });
+
+  const q=new URLSearchParams(location.search);
+  if(q.has('p')) palette=Math.max(0,Math.min(PALETTES.length-1,+q.get('p')|0));
+  if(q.has('t')) t0=performance.now()-(+q.get('t')*1000);
+
+  resize();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

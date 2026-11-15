@@ -1,0 +1,10 @@
+.ui-review/
+.edge-preview/
+*-review.png
+*-mobile.png
+*-preview.png
+dist/
+node_modules/
+.vercel/
+.env
+.env.*
